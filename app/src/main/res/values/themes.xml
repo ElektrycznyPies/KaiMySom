@@ -1,0 +1,17 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <style name="Base.Theme.CityOverlay"
+        parent="Theme.Material3.DayNight.NoActionBar">
+
+        <item name="android:windowSplashScreenBackground"
+            tools:targetApi="31">#CCCCCC</item>
+
+        <item name="android:windowSplashScreenBrandingImage"
+            tools:targetApi="31">@drawable/splash_napis</item>
+
+    </style>
+
+    <style name="Theme.CityOverlay"
+        parent="Base.Theme.CityOverlay" />
+
+</resources>
