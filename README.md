@@ -1,5 +1,4 @@
-# KaiMySom 
-Wersja 1.1.1
+![KaiMySom v.1.1.1](docs/images/kms.png)
 
 Czy zdarzyło ci się jechać na motocyklu przez urokliwe miasteczko, którego nazwy nie znasz, bo nawigacja wyświetla tylko układ ulic, Biedronkę i szpital, ale nie nazwę miasta? 
 
