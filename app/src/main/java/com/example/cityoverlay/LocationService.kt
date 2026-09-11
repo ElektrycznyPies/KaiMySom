@@ -1,4 +1,3 @@
-// CITY_OVERLAY_FALLBACK_R5 — na podstawie przesłanego kodu; zgodny z MainActivity R4
 package com.example.cityoverlay
 
 import android.Manifest
@@ -67,6 +66,8 @@ class LocationService : Service() {
         private const val MAX_GPS_AGE_MS = 30_000L
         private const val MAX_RESPONSE_BYTES = 12 * 1024 * 1024
         private const val MAX_POINTS = 200_000
+        private const val MIN_PARK_AREA_M2 = 80_000.0 // 8 ha; tylko zwykłe parki.
+        private const val NATURE_QUERY_TIMEOUT_SECONDS = 20
         val RADIUS_STEPS = intArrayOf(200, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000)
 
         var isRunning = false
@@ -97,7 +98,13 @@ class LocationService : Service() {
 
     private data class Config(val cities: Boolean, val rivers: Boolean, val forests: Boolean, val radius: Int)
     private enum class Kind { RIVER, FOREST }
-    private enum class Stage(val label: String) { RIVERS("Rzeka"), FORESTS("Las"), INSIDE("Wnętrze obszaru") }
+    private enum class Stage(val label: String) {
+        RIVERS("Rzeka"),
+        ISLANDS_BEACHES("Wyspy i plaże"),
+        PARKS("Parki"),
+        FORESTS("Lasy i obszary chronione"),
+        INSIDE("Wnętrze obszaru")
+    }
     private data class Feature(
         val key: String, val name: String, val kind: Kind, val importance: Int,
         val lines: List<List<GeoMath.Point>>, val rings: List<List<GeoMath.Point>>
@@ -135,6 +142,11 @@ class LocationService : Service() {
         .readTimeout(15, TimeUnit.SECONDS)
         .callTimeout(20, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false)
+        .build()
+    // Wspólna pula połączeń. Dłuższe oczekiwanie dotyczy tylko przyrody i is_in.
+    private val natureHttpClient = httpClient.newBuilder()
+        .readTimeout(40, TimeUnit.SECONDS)
+        .callTimeout(45, TimeUnit.SECONDS)
         .build()
     @Volatile private var destroyed = false
     @Volatile private var activeCall: Call? = null
@@ -405,10 +417,11 @@ class LocationService : Service() {
         }
     }
 
-    private fun enabled(stage: Stage, options: Config) = when (stage) {
-        Stage.RIVERS -> options.rivers
-        Stage.FORESTS, Stage.INSIDE -> options.forests
-    }
+    private fun enabled(stage: Stage, options: Config): Boolean =
+        when (stage) {
+            Stage.RIVERS -> options.rivers
+            else -> options.forests
+        }
 
     private fun needsCache(stage: Stage, p: GeoMath.Point, options: Config, stored: GeometryCache?, now: Long): Boolean {
         if (!enabled(stage, options)) return false
@@ -426,8 +439,8 @@ class LocationService : Service() {
         if (now < serverRetryAt || lastAnyFetchAt?.let { now - it < 2_000L } == true) return
         val p = point(location)
         val options = config
-        // Na starcie: rzeka, potem lasy, następnie lekkie is_in. Później najdawniej
-        // obsługiwany etap. Błąd lasu nie usuwa rzeki ani nie blokuje jej ponowień.
+        // Na starcie: rzeka, potem przyroda, następnie is_in. Później najdawniej
+        // obsługiwany etap. Etapy są sekwencyjne; zachowujemy wcześniejsze wyniki.
         val stage = Stage.values().filter { candidate ->
             val state = fetchStates.getValue(candidate)
             needsCache(candidate, p, options, state.cache, now) && now >= state.retryAt &&
@@ -463,11 +476,14 @@ class LocationService : Service() {
                     }
                 } else {
                     val fetchError = error as? FetchException
-                    state.failures = (state.failures + 1).coerceAtMost(3)
-                    val delay = maxOf(
-                        if (state.failures == 1) 5_000L else 10_000L,
-                        fetchError?.retryMs ?: 0L
-                    )
+                    state.failures = (state.failures + 1).coerceAtMost(5)
+                    val multiplier = 1L shl (state.failures - 1)
+                    val backoff = if (fetchError?.pauseAll == true) {
+                        (30_000L * multiplier).coerceAtMost(300_000L)
+                    } else {
+                        (5_000L * multiplier).coerceAtMost(60_000L)
+                    }
+                    val delay = maxOf(backoff, fetchError?.retryMs ?: 0L)
                     state.retryAt = if (fetchError?.terminal == true) Long.MAX_VALUE else finished + delay
                     state.error = fetchError?.summary ?: when (error) {
                         is SocketTimeoutException, is java.io.InterruptedIOException -> "przekroczony czas odpowiedzi"
@@ -492,29 +508,91 @@ class LocationService : Service() {
         "[\"leisure\"=\"nature_reserve\"][\"name\"]",
         "[\"boundary\"=\"protected_area\"][\"protect_class\"~\"^(1|1a|1b|2|4)$\"][\"name\"]"
     )
-    private fun overpassQuery(p: GeoMath.Point, radius: Int, stage: Stage): String = buildString {
-        append("[out:json][timeout:8];\n")
+
+    private val parkFilters = listOf(
+        "[\"leisure\"=\"park\"][\"name\"]"
+    )
+
+    private val islandBeachFilters = listOf(
+        "[\"place\"~\"^(island|islet)$\"][\"name\"]",
+        "[\"natural\"=\"beach\"][\"name\"]"
+    )
+
+    private fun searchBbox(p: GeoMath.Point, radius: Int): String {
+        val angular = radius.coerceAtLeast(1) * 1.01 / 6_371_008.8
+        val latDelta = Math.toDegrees(angular)
+
+        val south = (p.lat - latDelta).coerceAtLeast(-90.0)
+        val north = (p.lat + latDelta).coerceAtMost(90.0)
+
+        val lonDelta = if (south <= -90.0 || north >= 90.0) {
+            180.0
+        } else {
+            val extremeLat = maxOf(
+                kotlin.math.abs(south),
+                kotlin.math.abs(north)
+            )
+            Math.toDegrees(
+                angular / kotlin.math.cos(Math.toRadians(extremeLat))
+            ).coerceAtMost(180.0)
+        }
+
+        fun wrapLongitude(value: Double): Double =
+            ((value + 540.0) % 360.0) - 180.0
+
+        val west = if (lonDelta >= 180.0) -180.0
+        else wrapLongitude(p.lon - lonDelta)
+        val east = if (lonDelta >= 180.0) 180.0
+        else wrapLongitude(p.lon + lonDelta)
+
+        return "$south,$west,$north,$east"
+    }
+    private fun overpassQuery(
+        p: GeoMath.Point,
+        radius: Int,
+        stage: Stage
+    ): String = buildString {
+        val timeout =
+            if (stage == Stage.RIVERS) 8 else NATURE_QUERY_TIMEOUT_SECONDS
+
+        append("[out:json][timeout:$timeout];\n")
+
         when (stage) {
             Stage.RIVERS -> {
-                append("way[\"waterway\"~\"^(river|canal)$\"][\"name\"](around:$radius,${p.lat},${p.lon});\n")
+                append(
+                    "way[\"waterway\"~\"^(river|canal)$\"][\"name\"]" +
+                            "(around:$radius,${p.lat},${p.lon});\n"
+                )
                 append("out geom;")
             }
-            Stage.FORESTS -> {
-                append("(\n")
-                for (filter in forestFilters) {
-                    append("way$filter(around:$radius,${p.lat},${p.lon});\n")
-                    append("rel$filter(around:$radius,${p.lat},${p.lon});\n")
+
+            Stage.FORESTS, Stage.PARKS, Stage.ISLANDS_BEACHES -> {
+                val filters = when (stage) {
+                    Stage.FORESTS -> forestFilters
+                    Stage.PARKS -> parkFilters
+                    Stage.ISLANDS_BEACHES -> islandBeachFilters
+                    else -> error("Nieobsługiwana grupa")
                 }
+
+                val bbox = searchBbox(p, radius)
+                append("(\n")
+
+                for (filter in filters) {
+                    append("way$filter($bbox);\n")
+                    append("rel$filter($bbox);\n")
+                }
+
                 append(");\nout geom;")
             }
+
             Stage.INSIDE -> {
                 append("is_in(${p.lat},${p.lon})->.containing;\n(\n")
-                for (filter in forestFilters) {
+
+                for (filter in forestFilters + islandBeachFilters) {
                     append("area.containing$filter;\n")
                     append("way.containing$filter;\n")
                 }
-                // Wystarczą nazwy i tagi. Nie pobieramy całych wielkich puszcz
-                // przez pivot/out geom tylko po to, by rozpoznać pobyt wewnątrz.
+
                 append(");\nout tags;")
             }
         }
@@ -587,7 +665,8 @@ class LocationService : Service() {
         val request = Request.Builder().url(server + "?data=" + URLEncoder.encode(query, "UTF-8"))
             .header("User-Agent", "CityOverlayApp/2.1 (personal Android geographic overlay)")
             .build()
-        val call = httpClient.newCall(request)
+        val client = if (stage == Stage.RIVERS) httpClient else natureHttpClient
+        val call = client.newCall(request)
         activeCall = call
         try {
             if (destroyed) { call.cancel(); throw IOException("Usługa zatrzymana") }
@@ -632,7 +711,10 @@ class LocationService : Service() {
                 if (root.optString("remark").isNotBlank()) {
                     val remark = root.optString("remark")
                     val timedOut = remark.contains("timed out", true)
-                    throw FetchException(remark, if (timedOut) "limit czasu Overpass" else "niepełna odpowiedź Overpass", allowFallback = timedOut)
+                    val summary = if (timedOut) "limit czasu Overpass" else "niepełna odpowiedź Overpass"
+                    // Pełna treść pozostaje w Logcat; opis w panelu ma ograniczoną długość.
+                    val detail = remark.replace(Regex("\\s+"), " ").take(350)
+                    throw FetchException(remark, "$summary: $detail", allowFallback = timedOut)
                 }
                 return parseFeatures(root.getJSONArray("elements"), stage == Stage.INSIDE)
             }
@@ -662,12 +744,11 @@ class LocationService : Service() {
             val name = tags.optString("name:pl").ifBlank { tags.optString("name") }.trim().replace(Regex("\\s+"), " ").take(160)
             if (name.isBlank()) continue
             if (name.lowercase(Locale.ROOT) in setOf("las", "lasy", "puszcza", "forest", "wood", "woods", "rezerwat", "nature reserve", "park", "rzeka", "river", "kanał", "canal")) continue
+            val matchesForestFilter = matchesExistingNature(tags)
+            val ordinaryPark = tags.optString("leisure") == "park" && !matchesForestFilter
             val kind = when {
                 tags.optString("waterway") in setOf("river", "canal") -> Kind.RIVER
-                tags.optString("landuse") == "forest" || tags.optString("natural") == "wood" ||
-                        tags.optString("boundary") in setOf("forest", "national_park") ||
-                        tags.optString("leisure") == "nature_reserve" ||
-                        (tags.optString("boundary") == "protected_area" && tags.optString("protect_class") in setOf("1", "1a", "1b", "2", "4")) -> Kind.FOREST
+                matchesForestFilter || ordinaryPark -> Kind.FOREST
                 else -> continue
             }
             val importance = when {
@@ -679,7 +760,7 @@ class LocationService : Service() {
             val key = "${el.optString("type")}/${el.getLong("id")}"
             if (insideOnly) {
                 // is_in już ustaliło zawieranie punktu. Te rekordy mają tylko tagi.
-                if (kind == Kind.FOREST) features[key] = Feature(key, name, kind, importance, emptyList(), emptyList())
+                if (kind == Kind.FOREST && !ordinaryPark) features[key] = Feature(key, name, kind, importance, emptyList(), emptyList())
                 continue
             }
             val lines = mutableListOf<List<GeoMath.Point>>()
@@ -710,14 +791,58 @@ class LocationService : Service() {
             }
             if (lines.isEmpty()) continue
             var rings: List<List<GeoMath.Point>> = emptyList()
+            var areaM2: Double? = null
             if (kind == Kind.FOREST && complete && outerParts.isNotEmpty()) {
                 val outer = GeoMath.stitchRings(outerParts)
                 val inner = GeoMath.stitchRings(innerParts)
-                if (outer.complete && inner.complete) rings = outer.closed + inner.closed
+                if (outer.complete && inner.complete) {
+                    rings = outer.closed + inner.closed
+                    if (ordinaryPark) {
+                        areaM2 = (outer.closed.sumOf { approximateRingAreaM2(it) } -
+                                inner.closed.sumOf { approximateRingAreaM2(it) }).coerceAtLeast(0.0)
+                    }
+                }
             }
+            // Bez kompletnych granic nie zgadujemy wielkości zwykłego parku.
+            // Obiekty pasujące do dawnych filtrów pozostają bez progu powierzchni.
+            if (ordinaryPark && (areaM2 == null || !areaM2.isFinite() || areaM2 < MIN_PARK_AREA_M2)) continue
             features[key] = Feature(key, name, kind, importance, lines, rings)
         }
         return features.values.toList()
+    }
+
+    private fun matchesExistingNature(tags: JSONObject): Boolean =
+        tags.optString("landuse") == "forest" || tags.optString("natural") == "wood" ||
+                tags.optString("boundary") in setOf("forest", "national_park") ||
+                tags.optString("leisure") == "nature_reserve" ||
+                (tags.optString("boundary") == "protected_area" &&
+                        tags.optString("protect_class") in setOf("1", "1a", "1b", "2", "4"))
+                || tags.optString("place") in setOf("island", "islet")
+                || tags.optString("natural") == "beach"
+
+    // Lokalna projekcja i wzór sznurowadłowy: wystarczające przybliżenie dla parków.
+    // Każdy pierścień liczymy osobno; kierunek zapisu punktów nie zmienia wyniku.
+    private fun approximateRingAreaM2(ring: List<GeoMath.Point>): Double {
+        if (ring.size < 4 || ring.first() != ring.last()) return 0.0
+        val origin = ring.first()
+        val earth = 6_371_008.8
+        val cosLat = kotlin.math.cos(Math.toRadians(ring.map { it.lat }.average()))
+        fun x(p: GeoMath.Point): Double {
+            val lonDelta = ((p.lon - origin.lon + 540.0) % 360.0) - 180.0
+            return earth * Math.toRadians(lonDelta) * cosLat
+        }
+        fun y(p: GeoMath.Point) = earth * Math.toRadians(p.lat - origin.lat)
+        var twiceArea = 0.0
+        var previousX = x(origin)
+        var previousY = y(origin)
+        for (i in 1 until ring.size) {
+            val nextX = x(ring[i])
+            val nextY = y(ring[i])
+            twiceArea += previousX * nextY - nextX * previousY
+            previousX = nextX
+            previousY = nextY
+        }
+        return kotlin.math.abs(twiceArea) / 2.0
     }
 
     private fun requestRender() {
@@ -791,7 +916,16 @@ class LocationService : Service() {
         val version = renderVersion
         val options = config
         val riverCache = fetchStates.getValue(Stage.RIVERS).cache
-        val forestCache = fetchStates.getValue(Stage.FORESTS).cache
+        // val forestCache = fetchStates.getValue(Stage.FORESTS).cache
+
+        val natureFeatures = listOf(
+            Stage.FORESTS,
+            Stage.PARKS,
+            Stage.ISLANDS_BEACHES
+        ).flatMap { stage ->
+            fetchStates.getValue(stage).cache?.features.orEmpty()
+        }.distinctBy { it.key }
+
         val insideCache = fetchStates.getValue(Stage.INSIDE).cache
         val p = point(l)
         val now = SystemClock.elapsedRealtime()
@@ -801,7 +935,7 @@ class LocationService : Service() {
         rendering = true
         geometryExecutor.execute {
             val result = try {
-                val nearby = (riverCache?.features.orEmpty() + forestCache?.features.orEmpty()).asSequence()
+                val nearby = (riverCache?.features.orEmpty() + natureFeatures).asSequence()
                     .filter { (it.kind == Kind.RIVER && options.rivers) || (it.kind == Kind.FOREST && options.forests) }
                     .map { Candidate(it, GeoMath.nearest(p, it.lines, it.rings)) }
                     .filter { it.nearest.metres <= options.radius }.toMutableList()
@@ -813,7 +947,7 @@ class LocationService : Service() {
                     if (moved <= minOf(options.radius, 500).toDouble()) {
                         insideCache.features.forEach { hint ->
                             // Jeżeli znamy cały obrys, wynik lokalnej geometrii jest ważniejszy.
-                            val hasFullGeometry = forestCache?.features.orEmpty().any { it.name == hint.name && it.rings.isNotEmpty() }
+                            val hasFullGeometry = natureFeatures.any { it.name == hint.name && it.rings.isNotEmpty() }
                             if (!hasFullGeometry) nearby.add(Candidate(hint, GeoMath.Nearest(0.0, 0.0, moved <= 50.0)))
                         }
                     }

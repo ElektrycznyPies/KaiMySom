@@ -1,4 +1,3 @@
-// CITY_OVERLAY_UI_R4 — zgodny komplet: LocationService.kt + MainActivity.kt
 package com.example.cityoverlay
 
 import android.Manifest
@@ -75,11 +74,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
         cbRivers = CheckBox(this).apply {
-            text = "🌊 Rzeki / kanały"
+            text = "🌊 Rzeki, kanały"
             isChecked = prefs.getBoolean("show_rivers", true)
         }
         cbForests = CheckBox(this).apply {
-            text = "🌲 Lasy / puszcze / rezerwaty / parki narodowe"
+            text = "🌲 Lasy, puszcze, przyroda"
             isChecked = prefs.getBoolean("show_forests", true)
         }
         val checks = listOf(cbCities, cbRivers, cbForests)
@@ -161,20 +160,21 @@ class MainActivity : AppCompatActivity() {
             text = "Etykietkę nakładki można przesuwać w dowolne miejsce ekranu. Odległości są przybliżone. Poniżej 50 m pozostaje sama nazwa. Strzałka wskazuje położenie względem kierunku jazdy; na postoju lub przy niepewnym kierunku znika."
             setPadding(0, dp(20), 0, dp(12))
         })
+
+        layout.addView(TextView(this).apply {
+            text = HtmlCompat.fromHtml(
+                "<h3><b>${getString(R.string.app_name)}</b></h3> v. ${getString(R.string.ver_number)}<br>" +
+                        "Nakładka nawigacyjna z nazwami miast, rzek i lasów<br>" +
+                        "© ${getString(R.string.author)}, 2026 [użyto GPT-6 Astra]",
+                HtmlCompat.FROM_HTML_MODE_LEGACY
+            )
+            setPadding(0, dp(20), 0, dp(12))
+        })
         layout.addView(TextView(this).apply {
             text = "Dane obiektów: © OpenStreetMap contributors"
             textSize = 12f
             setTextColor(Color.rgb(30, 100, 180))
             setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.openstreetmap.org/copyright"))) }
-        })
-        layout.addView(TextView(this).apply {
-            text = HtmlCompat.fromHtml(
-                "<h2><b>${getString(R.string.app_name)}</b></h2> v. ${getString(R.string.ver_number)}<br>" +
-                        "Nakładka nawigacyjna z nazwami miast, rzek i lasów<br>" +
-                        "© ${getString(R.string.author)} + GPT-6 Astra, 2026",
-                HtmlCompat.FROM_HTML_MODE_LEGACY
-            )
-            setPadding(0, dp(20), 0, dp(12))
         })
         setContentView(ScrollView(this).apply { addView(layout) })
         updateButtonState()
@@ -241,3 +241,4 @@ class MainActivity : AppCompatActivity() {
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
     private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
 }
+
